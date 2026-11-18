@@ -1,0 +1,1296 @@
+import javax.swing.*;
+import javax.swing.border.*;
+import javax.swing.plaf.basic.BasicScrollBarUI;
+import java.awt.*;
+import java.awt.event.*;
+import java.awt.geom.*;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.*;
+import java.util.List;
+
+/**
+ * ============================================================================
+ *  PAGE REPLACEMENT LAB  -  FIFO | LRU | OPTIMAL
+ *  Operating Systems Project - Topic 3: Page Replacement Algorithms
+ * ============================================================================
+ *  HOW TO RUN
+ *    VS Code : open this file and press the "Run" button above main()
+ *    Terminal: javac PageReplacementSimulator.java
+ *              java  PageReplacementSimulator            (opens the GUI)
+ *              java  PageReplacementSimulator --test     (prints test evidence)
+ *  Requires JDK 11 or newer. No external libraries.
+ *
+ *  INPUT   : page-reference string + number of page frames
+ *  PROCESS : read references in order, simulate frame contents, detect
+ *            HIT / FAULT, apply the replacement rule when frames are full
+ *  OUTPUT  : frame-by-frame trace, HIT/FAULT per reference, evicted page,
+ *            final frames, total hits/faults, hit & fault ratio (%)
+ *
+ *  Tie-break rules (documented for the oral defense):
+ *    FIFO    : evicts the page that has been in memory the longest.
+ *    LRU     : evicts the page whose last use is the oldest.
+ *    OPTIMAL : evicts the page whose next use is farthest in the future;
+ *              pages never used again are preferred; ties -> oldest loaded.
+ * ============================================================================
+ */
+public class Main {
+
+    static final int MAX_REFS = 60;
+    static final int MAX_FRAMES = 12;
+
+    // =====================================================================
+    //  1.  ALGORITHM ENGINE  (all results are computed, nothing hard-coded)
+    // =====================================================================
+    enum Algo {
+        FIFO("FIFO", "First-In, First-Out", new Color(0x5B8CFF)),
+        LRU("LRU", "Least Recently Used", new Color(0xB36BFF)),
+        OPTIMAL("OPTIMAL", "Farthest Future Use (Belady's MIN)", new Color(0xFFB347));
+
+        final String label, subtitle;
+        final Color color;
+
+        Algo(String label, String subtitle, Color color) {
+            this.label = label;
+            this.subtitle = subtitle;
+            this.color = color;
+        }
+    }
+
+    /** Everything recorded for one algorithm run. */
+    static final class Result {
+        final Algo algo;
+        final int[] refs;
+        final int frames;
+        final int[][] snap;      // snap[step][frame] = page in frame (-1 = empty)
+        final boolean[] fault;   // fault[step]
+        final int[] evicted;     // evicted[step] = page removed (-1 = none)
+        final int[] slot;        // slot[step] = frame index loaded / hit
+        final String[] note;     // human-readable explanation per step
+        int hits, faults;
+
+        Result(Algo algo, int[] refs, int frames) {
+            this.algo = algo;
+            this.refs = refs;
+            this.frames = frames;
+            int n = refs.length;
+            snap = new int[n][];
+            fault = new boolean[n];
+            evicted = new int[n];
+            slot = new int[n];
+            note = new String[n];
+        }
+
+        double hitPct() { return refs.length == 0 ? 0 : 100.0 * hits / refs.length; }
+        double faultPct() { return refs.length == 0 ? 0 : 100.0 * faults / refs.length; }
+        int[] finalFrames() { return snap[refs.length - 1]; }
+    }
+
+    static final class Engine {
+
+        static int[] parseRefs(String s) {
+            String t = s == null ? "" : s.trim();
+            if (t.isEmpty())
+                throw new IllegalArgumentException("Enter a page-reference string, e.g.  7 0 1 2 0 3 0 4");
+            String[] parts = t.split("[,;\\s]+");
+            if (parts.length > MAX_REFS)
+                throw new IllegalArgumentException("Too many references (max " + MAX_REFS + ").");
+            int[] out = new int[parts.length];
+            for (int i = 0; i < parts.length; i++) {
+                try {
+                    out[i] = Integer.parseInt(parts[i]);
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException("'" + parts[i]
+                            + "' is not a valid page number. Use whole numbers separated by spaces or commas.");
+                }
+                if (out[i] < 0 || out[i] > 999)
+                    throw new IllegalArgumentException("Page numbers must be between 0 and 999.");
+            }
+            return out;
+        }
+
+        static Result simulate(Algo a, int[] refs, int n) {
+            Result r = new Result(a, refs, n);
+            int[] fr = new int[n];
+            Arrays.fill(fr, -1);
+            int[] loadT = new int[n];   // when the page in this frame was loaded
+            int[] useT = new int[n];    // when the page in this frame was last used
+            int ptr = 0;                // FIFO pointer (next victim)
+
+            for (int i = 0; i < refs.length; i++) {
+                int p = refs[i];
+                int hit = -1;
+                for (int k = 0; k < n; k++) if (fr[k] == p) { hit = k; break; }
+
+                if (hit >= 0) {
+                    r.hits++;
+                    r.fault[i] = false;
+                    r.evicted[i] = -1;
+                    r.slot[i] = hit;
+                    useT[hit] = i;
+                    r.note[i] = "Page " + p + " is already in Frame " + (hit + 1) + " -> HIT"
+                            + (a == Algo.LRU ? " (recency refreshed)" : "");
+                } else {
+                    r.faults++;
+                    r.fault[i] = true;
+                    int empty = -1;
+                    for (int k = 0; k < n; k++) if (fr[k] == -1) { empty = k; break; }
+                    int v;
+                    String why;
+                    if (empty >= 0) {
+                        v = empty;
+                        r.evicted[i] = -1;
+                        why = "Free frame available -> loaded into Frame " + (v + 1);
+                    } else {
+                        String reason;
+                        if (a == Algo.FIFO) {
+                            v = ptr;
+                            reason = "oldest page in memory (loaded at ref #" + (loadT[v] + 1) + ")";
+                        } else if (a == Algo.LRU) {
+                            v = 0;
+                            for (int k = 1; k < n; k++) if (useT[k] < useT[v]) v = k;
+                            reason = "least recently used (last used at ref #" + (useT[v] + 1) + ")";
+                        } else {
+                            v = 0;
+                            int best = -1;
+                            for (int k = 0; k < n; k++) {
+                                int next = refs.length;   // "never used again"
+                                for (int j = i + 1; j < refs.length; j++)
+                                    if (refs[j] == fr[k]) { next = j; break; }
+                                if (next > best || (next == best && loadT[k] < loadT[v])) {
+                                    best = next;
+                                    v = k;
+                                }
+                            }
+                            reason = best == refs.length
+                                    ? "never used again"
+                                    : "next used farthest away (at ref #" + (best + 1) + ")";
+                        }
+                        r.evicted[i] = fr[v];
+                        why = "Memory full -> evict page " + fr[v] + " from Frame " + (v + 1) + " [" + reason + "]";
+                    }
+                    fr[v] = p;
+                    loadT[v] = i;
+                    useT[v] = i;
+                    r.slot[i] = v;
+                    ptr = (v + 1) % n;
+                    r.note[i] = "Page " + p + " not in memory -> FAULT. " + why;
+                }
+                r.snap[i] = fr.clone();
+            }
+            return r;
+        }
+
+        // ---------- text output (used by Step Log tab, export and console) ----------
+        static String cell(int v) { return v < 0 ? "-" : String.valueOf(v); }
+
+        static String framesStr(int[] f) {
+            StringBuilder sb = new StringBuilder("[ ");
+            for (int k = 0; k < f.length; k++) {
+                if (k > 0) sb.append(" | ");
+                sb.append(cell(f[k]));
+            }
+            return sb.append(" ]").toString();
+        }
+
+        static String report(Result r) {
+            int n = r.refs.length;
+            String bar = "=".repeat(Math.max(48, 12 + 6 * n));
+            StringBuilder sb = new StringBuilder();
+            sb.append(bar).append('\n');
+            sb.append(" PAGE REPLACEMENT - ").append(r.algo.label).append("  (").append(r.algo.subtitle).append(")\n");
+            sb.append(" Frames: ").append(r.frames).append("    References: ").append(n).append('\n');
+            sb.append(bar).append("\n\n");
+            sb.append(String.format("%-10s", "Reference"));
+            for (int p : r.refs) sb.append(String.format("%6d", p));
+            sb.append('\n');
+            for (int k = 0; k < r.frames; k++) {
+                sb.append(String.format("%-10s", "Frame " + (k + 1)));
+                for (int i = 0; i < n; i++) sb.append(String.format("%6s", cell(r.snap[i][k])));
+                sb.append('\n');
+            }
+            sb.append(String.format("%-10s", "Result"));
+            for (int i = 0; i < n; i++) sb.append(String.format("%6s", r.fault[i] ? "FAULT" : "HIT"));
+            sb.append('\n');
+            sb.append(String.format("%-10s", "Evicted"));
+            for (int i = 0; i < n; i++) sb.append(String.format("%6s", cell(r.evicted[i])));
+            sb.append("\n\n");
+            sb.append("Final frames  : ").append(framesStr(r.finalFrames())).append('\n');
+            sb.append("Total refs    : ").append(n).append('\n');
+            sb.append("Total hits    : ").append(r.hits).append('\n');
+            sb.append("Total faults  : ").append(r.faults).append('\n');
+            sb.append(String.format(Locale.US, "Hit ratio     : %d/%d = %.2f%%%n", r.hits, n, r.hitPct()));
+            sb.append(String.format(Locale.US, "Fault ratio   : %d/%d = %.2f%%%n", r.faults, n, r.faultPct()));
+            return sb.toString();
+        }
+
+        static String stepLog(Result r) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("--- ").append(r.algo.label).append(" : step-by-step trace ---\n");
+            for (int i = 0; i < r.refs.length; i++) {
+                sb.append(String.format("Step %02d | Ref %-3d | %-5s | %s%n", i + 1, r.refs[i],
+                        r.fault[i] ? "FAULT" : "HIT", r.note[i]));
+                sb.append("        Frames after step: ").append(framesStr(r.snap[i])).append('\n');
+            }
+            return sb.toString();
+        }
+
+        static String summary(List<Result> rs) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("COMPARISON SUMMARY\n");
+            sb.append(String.format("%-10s %6s %8s %9s %9s%n", "Algorithm", "Hits", "Faults", "Hit %", "Fault %"));
+            for (Result r : rs)
+                sb.append(String.format(Locale.US, "%-10s %6d %8d %8.2f%% %8.2f%%%n",
+                        r.algo.label, r.hits, r.faults, r.hitPct(), r.faultPct()));
+            return sb.toString();
+        }
+
+        // ---------- built-in test evidence:  java PageReplacementSimulator --test ----------
+        static int selfTest() {
+            Object[][] cases = {
+                    {"Test 1 - Textbook string, 3 frames", "7 0 1 2 0 3 0 4 2 3 0 3 2 1 2 0 1 7 0 1", 3, new int[]{15, 12, 9}},
+                    {"Test 2 - Belady string, 3 frames", "1 2 3 4 1 2 5 1 2 3 4 5", 3, new int[]{9, 10, 7}},
+                    {"Test 3 - Belady string, 4 frames", "1 2 3 4 1 2 5 1 2 3 4 5", 4, new int[]{10, 8, 6}},
+                    {"Test 4 - All distinct pages, 3 frames", "1 2 3 4 5 6", 3, new int[]{6, 6, 6}},
+                    {"Test 5 - Same page repeated, 2 frames", "4 4 4 4 4", 2, new int[]{1, 1, 1}},
+            };
+            int failures = 0;
+            for (Object[] c : cases) {
+                int[] refs = parseRefs((String) c[1]);
+                int frames = (Integer) c[2];
+                int[] exp = (int[]) c[3];
+                System.out.println("\n" + c[0] + "   (refs: " + c[1] + ")");
+                System.out.println(String.format("  %-8s | %-14s | %-14s | %s", "Algo", "Expected F/H", "Actual F/H", "Status"));
+                for (Algo a : Algo.values()) {
+                    Result r = simulate(a, refs, frames);
+                    int ef = exp[a.ordinal()];
+                    int eh = refs.length - ef;
+                    boolean ok = r.faults == ef && r.hits == eh;
+                    if (!ok) failures++;
+                    System.out.println(String.format("  %-8s | %-14s | %-14s | %s", a.label,
+                            ef + " / " + eh, r.faults + " / " + r.hits, ok ? "PASS" : "FAIL"));
+                }
+            }
+            System.out.println("\n" + (failures == 0 ? "ALL TESTS PASSED" : failures + " TEST(S) FAILED"));
+            return failures;
+        }
+    }
+
+    // =====================================================================
+    //  2.  THEME + SMALL DRAWING HELPERS
+    // =====================================================================
+    static final class Theme {
+        static final Color BG = new Color(0x0A0E1F);
+        static final Color PANEL = new Color(0x131A33);
+        static final Color PANEL_2 = new Color(0x1C2548);
+        static final Color LINE = new Color(0x2A3563);
+        static final Color TEXT = new Color(0xEAEEFF);
+        static final Color MUTED = new Color(0x8E99C7);
+        static final Color HIT = new Color(0x2EE6A8);
+        static final Color FAULT = new Color(0xFF5C7A);
+        static final Color ACCENT = new Color(0x35D0FF);
+        static final Color ACCENT_2 = new Color(0x8B5CFF);
+        static final String UI_FONT, MONO_FONT;
+
+        static {
+            Set<String> fam = new HashSet<>(Arrays.asList(
+                    GraphicsEnvironment.getLocalGraphicsEnvironment().getAvailableFontFamilyNames()));
+            UI_FONT = fam.contains("Segoe UI") ? "Segoe UI" : fam.contains("Helvetica Neue") ? "Helvetica Neue" : "SansSerif";
+            MONO_FONT = fam.contains("Consolas") ? "Consolas" : fam.contains("Menlo") ? "Menlo" : "Monospaced";
+        }
+
+        static Font ui(int style, int size) { return new Font(UI_FONT, style, size); }
+        static Font mono(int style, int size) { return new Font(MONO_FONT, style, size); }
+        static Color alpha(Color c, int a) { return new Color(c.getRed(), c.getGreen(), c.getBlue(), a); }
+
+        static Graphics2D aa(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+            return g2;
+        }
+
+        static void centered(Graphics2D g, String s, int x, int y, int w, int h) {
+            FontMetrics fm = g.getFontMetrics();
+            g.drawString(s, x + (w - fm.stringWidth(s)) / 2, y + (h + fm.getAscent() - fm.getDescent()) / 2);
+        }
+    }
+
+    static class RoundPanel extends JPanel {
+        Color fill;
+        int arc;
+
+        RoundPanel(Color fill, int arc) {
+            this.fill = fill;
+            this.arc = arc;
+            setOpaque(false);
+        }
+
+        @Override
+        protected void paintComponent(Graphics g0) {
+            Graphics2D g = Theme.aa(g0);
+            g.setColor(fill);
+            g.fillRoundRect(0, 0, getWidth() - 1, getHeight() - 1, arc, arc);
+            g.setColor(Theme.LINE);
+            g.drawRoundRect(0, 0, getWidth() - 1, getHeight() - 1, arc, arc);
+            g.dispose();
+        }
+    }
+
+    /** Sidebar card whose height never stretches. */
+    static class SideCard extends RoundPanel {
+        SideCard() {
+            super(Theme.PANEL, 22);
+            setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
+            setBorder(new EmptyBorder(14, 16, 16, 16));
+            setAlignmentX(Component.LEFT_ALIGNMENT);
+        }
+
+        @Override
+        public Dimension getMaximumSize() { return new Dimension(Integer.MAX_VALUE, getPreferredSize().height); }
+    }
+
+    static class GlowButton extends JButton {
+        private final Color c1, c2;
+        private boolean hover;
+
+        GlowButton(String text, Color c1, Color c2) {
+            super(text);
+            this.c1 = c1;
+            this.c2 = c2;
+            setFocusPainted(false);
+            setBorderPainted(false);
+            setContentAreaFilled(false);
+            setOpaque(false);
+            setForeground(Color.WHITE);
+            setFont(Theme.ui(Font.BOLD, 13));
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            addMouseListener(new MouseAdapter() {
+                @Override public void mouseEntered(MouseEvent e) { hover = true; repaint(); }
+                @Override public void mouseExited(MouseEvent e) { hover = false; repaint(); }
+            });
+        }
+
+        /** Ghost (outlined) variant. */
+        GlowButton(String text) { this(text, null, null); }
+
+        @Override
+        protected void paintComponent(Graphics g0) {
+            Graphics2D g = Theme.aa(g0);
+            int w = getWidth(), h = getHeight();
+            if (c1 == null) {
+                g.setColor(hover ? Theme.LINE : Theme.PANEL_2);
+                g.fillRoundRect(0, 0, w - 1, h - 1, 14, 14);
+                g.setColor(Theme.LINE);
+                g.drawRoundRect(0, 0, w - 1, h - 1, 14, 14);
+                g.setColor(Theme.TEXT);
+            } else {
+                Color a = c1, b = c2;
+                if (hover) { a = a.brighter(); b = b.brighter(); }
+                if (getModel().isPressed()) { a = a.darker(); b = b.darker(); }
+                g.setColor(Theme.alpha(c2, hover ? 90 : 50));
+                g.fillRoundRect(0, 3, w - 1, h - 2, 16, 16);
+                g.setPaint(new GradientPaint(0, 0, a, w, h, b));
+                g.fillRoundRect(0, 0, w - 1, h - 3, 14, 14);
+                g.setColor(Color.WHITE);
+            }
+            g.setFont(getFont());
+            Theme.centered(g, getText(), 0, 0, w, h - (c1 == null ? 0 : 3));
+            g.dispose();
+        }
+    }
+
+    static class Pill extends JToggleButton {
+        private final Color color;
+
+        Pill(String text, Color color) {
+            super(text, true);
+            this.color = color;
+            setFocusPainted(false);
+            setBorderPainted(false);
+            setContentAreaFilled(false);
+            setOpaque(false);
+            setFont(Theme.ui(Font.BOLD, 12));
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        }
+
+        @Override
+        protected void paintComponent(Graphics g0) {
+            Graphics2D g = Theme.aa(g0);
+            int w = getWidth(), h = getHeight();
+            boolean on = isSelected();
+            g.setColor(on ? Theme.alpha(color, 55) : Theme.PANEL_2);
+            g.fillRoundRect(0, 0, w - 1, h - 1, h, h);
+            g.setColor(on ? color : Theme.LINE);
+            g.drawRoundRect(0, 0, w - 1, h - 1, h, h);
+            g.setColor(on ? color : Theme.MUTED);
+            g.fillOval(10, h / 2 - 4, 8, 8);
+            g.setFont(getFont());
+            g.setColor(on ? Theme.TEXT : Theme.MUTED);
+            Theme.centered(g, getText(), 14, 0, w - 14, h);
+            g.dispose();
+        }
+    }
+
+    static class NavButton extends JToggleButton {
+        private boolean hover;
+
+        NavButton(String t) {
+            super(t);
+            setFocusPainted(false);
+            setBorderPainted(false);
+            setContentAreaFilled(false);
+            setOpaque(false);
+            setFont(Theme.ui(Font.BOLD, 12));
+            setPreferredSize(new Dimension(128, 38));
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            addMouseListener(new MouseAdapter() {
+                @Override public void mouseEntered(MouseEvent e) { hover = true; repaint(); }
+                @Override public void mouseExited(MouseEvent e) { hover = false; repaint(); }
+            });
+        }
+
+        @Override
+        protected void paintComponent(Graphics g0) {
+            Graphics2D g = Theme.aa(g0);
+            int w = getWidth(), h = getHeight();
+            if (hover && !isSelected()) {
+                g.setColor(Theme.alpha(Theme.PANEL_2, 160));
+                g.fillRoundRect(0, 0, w, h - 4, 12, 12);
+            }
+            g.setFont(getFont());
+            g.setColor(isSelected() ? Theme.TEXT : Theme.MUTED);
+            Theme.centered(g, getText(), 0, 0, w, h - 4);
+            if (isSelected()) {
+                g.setPaint(new GradientPaint(0, 0, Theme.ACCENT, w, 0, Theme.ACCENT_2));
+                g.fillRoundRect(14, h - 5, w - 28, 3, 3, 3);
+            }
+            g.dispose();
+        }
+    }
+
+    static class StatChip extends JPanel {
+        private final String label, value;
+        private final Color color;
+
+        StatChip(String label, String value, Color color) {
+            this.label = label;
+            this.value = value;
+            this.color = color;
+            setOpaque(false);
+            setPreferredSize(new Dimension(112, 54));
+        }
+
+        @Override
+        protected void paintComponent(Graphics g0) {
+            Graphics2D g = Theme.aa(g0);
+            int w = getWidth(), h = getHeight();
+            g.setColor(Theme.PANEL_2);
+            g.fillRoundRect(0, 0, w - 1, h - 1, 16, 16);
+            g.setColor(Theme.alpha(color, 120));
+            g.drawRoundRect(0, 0, w - 1, h - 1, 16, 16);
+            g.setColor(color);
+            g.fillRoundRect(0, 12, 4, h - 24, 4, 4);
+            g.setFont(Theme.ui(Font.BOLD, 10));
+            g.setColor(Theme.MUTED);
+            g.drawString(label, 14, 19);
+            g.setFont(Theme.ui(Font.BOLD, 20));
+            g.setColor(color);
+            g.drawString(value, 14, 43);
+            g.dispose();
+        }
+    }
+
+    static class DarkScrollUI extends BasicScrollBarUI {
+        @Override protected void configureScrollBarColors() { thumbColor = Theme.LINE; trackColor = Theme.BG; }
+        @Override protected JButton createDecreaseButton(int o) { return zero(); }
+        @Override protected JButton createIncreaseButton(int o) { return zero(); }
+
+        private static JButton zero() {
+            JButton b = new JButton();
+            b.setPreferredSize(new Dimension(0, 0));
+            return b;
+        }
+
+        @Override
+        protected void paintTrack(Graphics g, JComponent c, Rectangle r) {
+            g.setColor(Theme.BG);
+            g.fillRect(r.x, r.y, r.width, r.height);
+        }
+
+        @Override
+        protected void paintThumb(Graphics g0, JComponent c, Rectangle r) {
+            Graphics2D g = Theme.aa(g0);
+            g.setColor(isThumbRollover() ? Theme.MUTED : Theme.LINE);
+            g.fillRoundRect(r.x + 2, r.y + 2, r.width - 4, r.height - 4, 8, 8);
+            g.dispose();
+        }
+    }
+
+    static JScrollPane darkScroll(Component c) {
+        JScrollPane sp = new JScrollPane(c);
+        sp.setBorder(null);
+        sp.getViewport().setBackground(Theme.BG);
+        sp.setBackground(Theme.BG);
+        sp.getVerticalScrollBar().setUI(new DarkScrollUI());
+        sp.getHorizontalScrollBar().setUI(new DarkScrollUI());
+        sp.getVerticalScrollBar().setPreferredSize(new Dimension(11, 11));
+        sp.getHorizontalScrollBar().setPreferredSize(new Dimension(11, 11));
+        sp.getVerticalScrollBar().setUnitIncrement(18);
+        sp.getHorizontalScrollBar().setUnitIncrement(24);
+        sp.setCorner(JScrollPane.LOWER_RIGHT_CORNER, cornerFill());
+        return sp;
+    }
+
+    static JComponent cornerFill() {
+        JPanel p = new JPanel();
+        p.setBackground(Theme.BG);
+        return p;
+    }
+
+    // =====================================================================
+    //  3.  CUSTOM VIEWS
+    // =====================================================================
+    static class Header extends JPanel {
+        Header() { setPreferredSize(new Dimension(10, 86)); }
+
+        @Override
+        protected void paintComponent(Graphics g0) {
+            Graphics2D g = Theme.aa(g0);
+            int w = getWidth(), h = getHeight();
+            g.setPaint(new GradientPaint(0, 0, new Color(0x0F1535), w, h, new Color(0x2A1466)));
+            g.fillRect(0, 0, w, h);
+            g.setColor(Theme.alpha(Theme.ACCENT, 28));
+            g.fillOval(w - 340, -110, 280, 280);
+            g.setColor(Theme.alpha(Theme.ACCENT_2, 40));
+            g.fillOval(w - 190, -50, 220, 220);
+            g.setPaint(new GradientPaint(0, 0, Theme.ACCENT, w, 0, Theme.ACCENT_2));
+            g.fillRect(0, h - 3, w, 3);
+
+            // logo: three "memory frames"
+            Color[] cs = {Algo.FIFO.color, Algo.LRU.color, Algo.OPTIMAL.color};
+            for (int i = 0; i < 3; i++) {
+                g.setColor(Theme.alpha(cs[i], 70));
+                g.fillRoundRect(28 + i * 20, 26, 16, 34, 6, 6);
+                g.setColor(cs[i]);
+                g.drawRoundRect(28 + i * 20, 26, 16, 34, 6, 6);
+                g.fillRoundRect(31 + i * 20, 30 + i * 8, 10, 8, 3, 3);
+            }
+            g.setFont(Theme.ui(Font.BOLD, 26));
+            g.setColor(Theme.TEXT);
+            String t1 = "PAGE REPLACEMENT ";
+            g.drawString(t1, 104, 44);
+            int off = g.getFontMetrics().stringWidth(t1);
+            g.setPaint(new GradientPaint(104 + off, 0, Theme.ACCENT, 104 + off + 60, 0, Theme.ACCENT_2));
+            g.drawString("LAB", 104 + off, 44);
+            g.setFont(Theme.ui(Font.PLAIN, 12));
+            g.setColor(Theme.MUTED);
+            g.drawString("Virtual-memory simulator  |  Operating Systems Project - Topic 3", 106, 64);
+
+            // algorithm badges
+            g.setFont(Theme.ui(Font.BOLD, 11));
+            int x = w - 30;
+            Algo[] all = Algo.values();
+            for (int i = all.length - 1; i >= 0; i--) {
+                int bw = g.getFontMetrics().stringWidth(all[i].label) + 28;
+                x -= bw;
+                g.setColor(Theme.alpha(all[i].color, 50));
+                g.fillRoundRect(x, 30, bw, 26, 26, 26);
+                g.setColor(all[i].color);
+                g.drawRoundRect(x, 30, bw, 26, 26, 26);
+                g.setColor(Theme.TEXT);
+                Theme.centered(g, all[i].label, x, 30, bw, 26);
+                x -= 8;
+            }
+            g.dispose();
+        }
+    }
+
+    /** The frame-by-frame trace table, drawn by hand. */
+    static class TracePanel extends JPanel {
+        static final int LBL = 96, CW = 46, RH = 40, PAD = 6;
+        final Result r;
+        int shown;
+        boolean animating;
+
+        TracePanel(Result r) {
+            this.r = r;
+            this.shown = r.refs.length;
+            setOpaque(false);
+        }
+
+        @Override
+        public Dimension getPreferredSize() {
+            return new Dimension(LBL + r.refs.length * CW + PAD * 2, (r.frames + 3) * RH + PAD * 2);
+        }
+
+        void setShown(int n, boolean anim) {
+            shown = n;
+            animating = anim;
+            repaint();
+        }
+
+        void followCurrent() {
+            Rectangle vr = getVisibleRect();
+            int x = LBL + PAD + (shown - 1) * CW;
+            scrollRectToVisible(new Rectangle(x - CW, vr.y, CW * 4, Math.max(1, vr.height)));
+        }
+
+        private void cell(Graphics2D g, int x, int y, Color fill, Color border, Color tc, String s, Font f) {
+            if (fill != null) {
+                g.setColor(fill);
+                g.fillRoundRect(x + 2, y + 3, CW - 4, RH - 6, 10, 10);
+            }
+            if (border != null) {
+                g.setColor(border);
+                g.drawRoundRect(x + 2, y + 3, CW - 4, RH - 6, 10, 10);
+            }
+            g.setFont(f);
+            g.setColor(tc);
+            Theme.centered(g, s, x + 2, y + 3, CW - 4, RH - 6);
+        }
+
+        @Override
+        protected void paintComponent(Graphics g0) {
+            Graphics2D g = Theme.aa(g0);
+            int n = r.frames;
+            Font bold14 = Theme.ui(Font.BOLD, 14), bold11 = Theme.ui(Font.BOLD, 11);
+
+            // row labels
+            g.setFont(Theme.ui(Font.BOLD, 12));
+            g.setColor(Theme.MUTED);
+            FontMetrics fm = g.getFontMetrics();
+            for (int row = 0; row < n + 3; row++) {
+                String name = row == 0 ? "Reference" : row <= n ? "Frame " + row : row == n + 1 ? "Result" : "Evicted";
+                int y = PAD + row * RH;
+                g.drawString(name, PAD, y + (RH + fm.getAscent() - fm.getDescent()) / 2);
+            }
+
+            for (int i = 0; i < shown; i++) {
+                int x = PAD + LBL + i * CW;
+                boolean f = r.fault[i];
+                if (animating && i == shown - 1) {
+                    g.setColor(Theme.alpha(Theme.ACCENT, 30));
+                    g.fillRoundRect(x, PAD - 2, CW, RH * (n + 3) + 4, 14, 14);
+                }
+                cell(g, x, PAD, Theme.PANEL_2, Theme.LINE, Theme.TEXT, String.valueOf(r.refs[i]), bold14);
+
+                for (int k = 0; k < n; k++) {
+                    int v = r.snap[i][k];
+                    int y = PAD + (k + 1) * RH;
+                    if (v < 0) {
+                        cell(g, x, y, Theme.BG, Theme.LINE, Theme.MUTED, "-", bold14);
+                    } else if (r.slot[i] == k && f) {
+                        cell(g, x, y, Theme.alpha(Theme.FAULT, 80), Theme.FAULT, Color.WHITE, String.valueOf(v), bold14);
+                    } else if (r.slot[i] == k) {
+                        cell(g, x, y, Theme.alpha(Theme.HIT, 70), Theme.HIT, Color.WHITE, String.valueOf(v), bold14);
+                    } else {
+                        cell(g, x, y, Theme.PANEL_2, Theme.LINE, Theme.TEXT, String.valueOf(v), bold14);
+                    }
+                }
+                int yr = PAD + (n + 1) * RH;
+                Color rc = f ? Theme.FAULT : Theme.HIT;
+                cell(g, x, yr, Theme.alpha(rc, 45), rc, rc, f ? "FAULT" : "HIT", bold11);
+
+                int ye = PAD + (n + 2) * RH;
+                int ev = r.evicted[i];
+                if (ev >= 0) cell(g, x, ye, Theme.alpha(Theme.FAULT, 30), null, Theme.FAULT, String.valueOf(ev), bold14);
+                else cell(g, x, ye, null, null, Theme.MUTED, "-", bold14);
+            }
+            g.dispose();
+        }
+    }
+
+    /** One result card: title, stat chips, trace table, final frames. */
+    static class AlgoCard extends RoundPanel {
+        final TracePanel trace;
+
+        AlgoCard(Result r) {
+            super(Theme.PANEL, 24);
+            setLayout(new BorderLayout(0, 12));
+            setBorder(new EmptyBorder(16, 18, 14, 18));
+            setAlignmentX(Component.LEFT_ALIGNMENT);
+
+            JPanel titles = new JPanel();
+            titles.setOpaque(false);
+            titles.setLayout(new BoxLayout(titles, BoxLayout.Y_AXIS));
+            JLabel name = new JLabel(r.algo.label);
+            name.setFont(Theme.ui(Font.BOLD, 22));
+            name.setForeground(r.algo.color);
+            JLabel sub = new JLabel(r.algo.subtitle);
+            sub.setFont(Theme.ui(Font.PLAIN, 12));
+            sub.setForeground(Theme.MUTED);
+            titles.add(name);
+            titles.add(sub);
+
+            JPanel chips = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+            chips.setOpaque(false);
+            chips.add(new StatChip("HITS", String.valueOf(r.hits), Theme.HIT));
+            chips.add(new StatChip("FAULTS", String.valueOf(r.faults), Theme.FAULT));
+            chips.add(new StatChip("HIT RATIO", String.format(Locale.US, "%.2f%%", r.hitPct()), Theme.ACCENT));
+            chips.add(new StatChip("FAULT RATIO", String.format(Locale.US, "%.2f%%", r.faultPct()), Theme.alpha(Theme.FAULT, 255)));
+
+            JPanel top = new JPanel(new BorderLayout());
+            top.setOpaque(false);
+            top.add(titles, BorderLayout.WEST);
+            top.add(chips, BorderLayout.EAST);
+
+            trace = new TracePanel(r);
+
+            JLabel foot = new JLabel(String.format(Locale.US,
+                    "Final frames: %s     Hit ratio: %d/%d = %.2f%%     Fault ratio: %d/%d = %.2f%%",
+                    Engine.framesStr(r.finalFrames()), r.hits, r.refs.length, r.hitPct(),
+                    r.faults, r.refs.length, r.faultPct()));
+            foot.setFont(Theme.mono(Font.BOLD, 12));
+            foot.setForeground(Theme.TEXT);
+
+            add(top, BorderLayout.NORTH);
+            add(trace, BorderLayout.CENTER);
+            add(foot, BorderLayout.SOUTH);
+        }
+
+        @Override
+        public Dimension getMaximumSize() { return new Dimension(Integer.MAX_VALUE, getPreferredSize().height); }
+    }
+
+    /** Side-by-side comparison with hit/fault bars. */
+    static class ComparePanel extends JPanel {
+        final List<Result> rs;
+
+        ComparePanel(List<Result> rs) {
+            this.rs = rs;
+            setOpaque(false);
+        }
+
+        @Override
+        public Dimension getPreferredSize() { return new Dimension(980, 250 + rs.size() * 84); }
+
+        @Override
+        protected void paintComponent(Graphics g0) {
+            Graphics2D g = Theme.aa(g0);
+            int W = Math.max(getWidth(), 900);
+            int len = rs.get(0).refs.length;
+            g.setFont(Theme.ui(Font.BOLD, 20));
+            g.setColor(Theme.TEXT);
+            g.drawString("ALGORITHM COMPARISON", 28, 44);
+            g.setFont(Theme.ui(Font.PLAIN, 12));
+            g.setColor(Theme.MUTED);
+            g.drawString(len + " references  |  " + rs.get(0).frames + " page frames", 28, 64);
+
+            int[] cx = {40, 250, 330, 420, 515};
+            String[] hd = {"ALGORITHM", "HITS", "FAULTS", "HIT %", "FAULT %"};
+            g.setFont(Theme.ui(Font.BOLD, 11));
+            g.setColor(Theme.MUTED);
+            for (int i = 0; i < hd.length; i++) g.drawString(hd[i], cx[i], 100);
+            g.drawString("HIT vs FAULT SHARE", 620, 100);
+
+            int minF = Integer.MAX_VALUE;
+            for (Result r : rs) minF = Math.min(minF, r.faults);
+
+            int y0 = 112;
+            for (Result r : rs) {
+                g.setColor(Theme.PANEL);
+                g.fillRoundRect(20, y0, W - 40, 72, 18, 18);
+                g.setColor(Theme.LINE);
+                g.drawRoundRect(20, y0, W - 40, 72, 18, 18);
+                g.setColor(r.algo.color);
+                g.fillRoundRect(20, y0 + 14, 5, 44, 5, 5);
+
+                g.setFont(Theme.ui(Font.BOLD, 17));
+                g.setColor(r.algo.color);
+                g.drawString(r.algo.label, cx[0], y0 + 33);
+                g.setFont(Theme.ui(Font.PLAIN, 11));
+                g.setColor(Theme.MUTED);
+                g.drawString(r.algo.subtitle, cx[0], y0 + 53);
+
+                if (rs.size() > 1 && r.faults == minF) {
+                    g.setFont(Theme.ui(Font.BOLD, 10));
+                    int bx = cx[0] + 88;
+                    g.setColor(Theme.alpha(Theme.HIT, 50));
+                    g.fillRoundRect(bx, y0 + 19, 40, 18, 18, 18);
+                    g.setColor(Theme.HIT);
+                    g.drawRoundRect(bx, y0 + 19, 40, 18, 18, 18);
+                    Theme.centered(g, "BEST", bx, y0 + 19, 40, 18);
+                }
+
+                g.setFont(Theme.ui(Font.BOLD, 20));
+                g.setColor(Theme.HIT);
+                g.drawString(String.valueOf(r.hits), cx[1], y0 + 43);
+                g.setColor(Theme.FAULT);
+                g.drawString(String.valueOf(r.faults), cx[2], y0 + 43);
+                g.setColor(Theme.TEXT);
+                g.setFont(Theme.ui(Font.BOLD, 16));
+                g.drawString(String.format(Locale.US, "%.2f%%", r.hitPct()), cx[3], y0 + 42);
+                g.drawString(String.format(Locale.US, "%.2f%%", r.faultPct()), cx[4], y0 + 42);
+
+                int bx = 620, by = y0 + 25, bw = W - 40 - bx - 16, bh = 22;
+                Shape old = g.getClip();
+                g.setClip(new RoundRectangle2D.Float(bx, by, bw, bh, bh, bh));
+                g.setColor(Theme.PANEL_2);
+                g.fillRect(bx, by, bw, bh);
+                int hw = (int) Math.round(bw * (double) r.hits / r.refs.length);
+                g.setColor(Theme.HIT);
+                g.fillRect(bx, by, hw, bh);
+                g.setColor(Theme.FAULT);
+                g.fillRect(bx + hw, by, bw - hw, bh);
+                g.setClip(old);
+                y0 += 84;
+            }
+
+            // verdict
+            StringBuilder winners = new StringBuilder();
+            for (Result r : rs) if (r.faults == minF) winners.append(winners.length() > 0 ? ", " : "").append(r.algo.label);
+            int y = y0 + 22;
+            g.setFont(Theme.ui(Font.BOLD, 14));
+            g.setColor(Theme.HIT);
+            if (rs.size() > 1) g.drawString("Fewest page faults: " + winners + "  (" + minF + " faults)", 28, y);
+            else g.drawString("Select two or more algorithms to compare them side by side.", 28, y);
+            g.setFont(Theme.ui(Font.PLAIN, 12));
+            g.setColor(Theme.MUTED);
+            g.drawString("OPTIMAL looks at future references, so it is the theoretical lower bound of faults.", 28, y + 26);
+            g.drawString("FIFO and LRU only use past information. FIFO can suffer Belady's anomaly (more frames -> more faults).", 28, y + 46);
+            g.dispose();
+        }
+    }
+
+    // =====================================================================
+    //  4.  MAIN WINDOW
+    // =====================================================================
+    static class App extends JFrame {
+        private JTextField refField;
+        private JLabel frameLbl, status;
+        private Pill[] pills;
+        private JCheckBox animate;
+        private JSlider speed;
+        private JTextArea logArea;
+        private JPanel traceHost, compareHost, content;
+        private CardLayout cards;
+        private final List<TracePanel> traces = new ArrayList<>();
+        private List<Result> last = new ArrayList<>();
+        private javax.swing.Timer timer;
+        private int frameCount = 3;
+        private final Random rnd = new Random();
+
+        App() {
+            super("Page Replacement Lab - FIFO | LRU | OPTIMAL");
+            setDefaultCloseOperation(EXIT_ON_CLOSE);
+            JPanel root = new JPanel(new BorderLayout());
+            root.setBackground(Theme.BG);
+            setContentPane(root);
+            root.add(new Header(), BorderLayout.NORTH);
+            root.add(buildSidebar(), BorderLayout.WEST);
+            root.add(buildMain(), BorderLayout.CENTER);
+            setSize(1380, 840);
+            setMinimumSize(new Dimension(1100, 680));
+            setLocationRelativeTo(null);
+            loadSample("7 0 1 2 0 3 0 4 2 3 0 3 2 1 2 0 1 7 0 1", 3);
+            runSimulation(false);
+        }
+
+        // ---------- sidebar ----------
+        private JLabel caption(String t) {
+            JLabel l = new JLabel(t);
+            l.setFont(Theme.ui(Font.BOLD, 11));
+            l.setForeground(Theme.MUTED);
+            l.setAlignmentX(Component.LEFT_ALIGNMENT);
+            return l;
+        }
+
+        private Component gap(int h) { return Box.createRigidArea(new Dimension(0, h)); }
+
+        private JComponent buildSidebar() {
+            JPanel side = new JPanel();
+            side.setLayout(new BoxLayout(side, BoxLayout.Y_AXIS));
+            side.setBackground(Theme.BG);
+            side.setBorder(new EmptyBorder(14, 14, 14, 4));
+
+            // --- input card
+            SideCard in = new SideCard();
+            in.add(caption("PAGE-REFERENCE STRING"));
+            in.add(gap(6));
+            refField = new JTextField();
+            refField.setFont(Theme.mono(Font.BOLD, 14));
+            refField.setBackground(Theme.PANEL_2);
+            refField.setForeground(Theme.TEXT);
+            refField.setCaretColor(Theme.ACCENT);
+            refField.setBorder(BorderFactory.createCompoundBorder(
+                    new LineBorder(Theme.LINE, 1, true), new EmptyBorder(8, 10, 8, 10)));
+            refField.setMaximumSize(new Dimension(Integer.MAX_VALUE, 40));
+            refField.setAlignmentX(Component.LEFT_ALIGNMENT);
+            refField.addActionListener(e -> runSimulation(animate.isSelected()));
+            in.add(refField);
+            in.add(gap(4));
+            JLabel hint = new JLabel("Numbers separated by spaces or commas (max " + MAX_REFS + ")");
+            hint.setFont(Theme.ui(Font.PLAIN, 11));
+            hint.setForeground(Theme.MUTED);
+            hint.setAlignmentX(Component.LEFT_ALIGNMENT);
+            in.add(hint);
+
+            in.add(gap(14));
+            in.add(caption("NUMBER OF PAGE FRAMES"));
+            in.add(gap(6));
+            JPanel stepper = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+            stepper.setOpaque(false);
+            stepper.setAlignmentX(Component.LEFT_ALIGNMENT);
+            GlowButton minus = new GlowButton("-");
+            GlowButton plus = new GlowButton("+");
+            minus.setPreferredSize(new Dimension(42, 38));
+            plus.setPreferredSize(new Dimension(42, 38));
+            frameLbl = new JLabel("3", SwingConstants.CENTER);
+            frameLbl.setFont(Theme.ui(Font.BOLD, 24));
+            frameLbl.setForeground(Theme.ACCENT);
+            frameLbl.setPreferredSize(new Dimension(54, 38));
+            minus.addActionListener(e -> setFrames(frameCount - 1));
+            plus.addActionListener(e -> setFrames(frameCount + 1));
+            stepper.add(minus);
+            stepper.add(frameLbl);
+            stepper.add(plus);
+            stepper.setMaximumSize(new Dimension(Integer.MAX_VALUE, 40));
+            in.add(stepper);
+
+            in.add(gap(14));
+            in.add(caption("ALGORITHMS TO RUN"));
+            in.add(gap(6));
+            JPanel pr = new JPanel(new GridLayout(1, 3, 6, 0));
+            pr.setOpaque(false);
+            pr.setAlignmentX(Component.LEFT_ALIGNMENT);
+            pills = new Pill[Algo.values().length];
+            for (Algo a : Algo.values()) {
+                pills[a.ordinal()] = new Pill(a.label, a.color);
+                pr.add(pills[a.ordinal()]);
+            }
+            pr.setPreferredSize(new Dimension(10, 34));
+            pr.setMaximumSize(new Dimension(Integer.MAX_VALUE, 34));
+            in.add(pr);
+
+            in.add(gap(14));
+            in.add(caption("QUICK SAMPLES"));
+            in.add(gap(6));
+            JPanel sm = new JPanel(new GridLayout(1, 3, 6, 0));
+            sm.setOpaque(false);
+            sm.setAlignmentX(Component.LEFT_ALIGNMENT);
+            GlowButton s1 = new GlowButton("Textbook");
+            GlowButton s2 = new GlowButton("Belady");
+            GlowButton s3 = new GlowButton("Random");
+            s1.addActionListener(e -> {
+                loadSample("7 0 1 2 0 3 0 4 2 3 0 3 2 1 2 0 1 7 0 1", 3);
+                setStatus("Loaded the classic textbook string (3 frames).", false);
+            });
+            s2.addActionListener(e -> {
+                loadSample("1 2 3 4 1 2 5 1 2 3 4 5", 3);
+                setStatus("Belady's anomaly: run with 3 frames, then 4 frames. FIFO faults go UP (9 to 10) even though memory grew.", false);
+            });
+            s3.addActionListener(e -> {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < 16; i++) sb.append(i > 0 ? " " : "").append(rnd.nextInt(8));
+                loadSample(sb.toString(), 3 + rnd.nextInt(2));
+                setStatus("Generated a random reference string.", false);
+            });
+            sm.add(s1);
+            sm.add(s2);
+            sm.add(s3);
+            sm.setPreferredSize(new Dimension(10, 34));
+            sm.setMaximumSize(new Dimension(Integer.MAX_VALUE, 34));
+            in.add(sm);
+            side.add(in);
+            side.add(gap(12));
+
+            // --- animation card
+            SideCard an = new SideCard();
+            animate = new JCheckBox("Animate the trace step by step");
+            animate.setOpaque(false);
+            animate.setForeground(Theme.TEXT);
+            animate.setFont(Theme.ui(Font.BOLD, 12));
+            animate.setFocusPainted(false);
+            animate.setAlignmentX(Component.LEFT_ALIGNMENT);
+            animate.setSelected(true);
+            an.add(animate);
+            an.add(gap(8));
+            an.add(caption("ANIMATION SPEED"));
+            speed = new JSlider(1, 10, 6);
+            speed.setOpaque(false);
+            speed.setAlignmentX(Component.LEFT_ALIGNMENT);
+            speed.addChangeListener(e -> { if (timer != null) timer.setDelay(delay()); });
+            an.add(speed);
+            side.add(an);
+            side.add(gap(14));
+
+            // --- buttons
+            GlowButton run = new GlowButton("RUN SIMULATION", Theme.ACCENT_2, Theme.ACCENT);
+            run.setFont(Theme.ui(Font.BOLD, 15));
+            run.setPreferredSize(new Dimension(10, 50));
+            run.setMaximumSize(new Dimension(Integer.MAX_VALUE, 50));
+            run.setAlignmentX(Component.LEFT_ALIGNMENT);
+            run.addActionListener(e -> runSimulation(animate.isSelected()));
+            side.add(run);
+            side.add(gap(10));
+
+            JPanel row = new JPanel(new GridLayout(1, 2, 8, 0));
+            row.setOpaque(false);
+            row.setAlignmentX(Component.LEFT_ALIGNMENT);
+            GlowButton clear = new GlowButton("Clear");
+            GlowButton export = new GlowButton("Export Report");
+            clear.addActionListener(e -> clearAll());
+            export.addActionListener(e -> exportReport());
+            row.add(clear);
+            row.add(export);
+            row.setPreferredSize(new Dimension(10, 38));
+            row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 38));
+            side.add(row);
+            side.add(gap(12));
+
+            status = new JLabel(" ");
+            status.setFont(Theme.ui(Font.PLAIN, 12));
+            status.setForeground(Theme.MUTED);
+            status.setAlignmentX(Component.LEFT_ALIGNMENT);
+            side.add(status);
+            side.add(Box.createVerticalGlue());
+
+            JScrollPane sp = darkScroll(side);
+            sp.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+            sp.setPreferredSize(new Dimension(372, 10));
+            return sp;
+        }
+
+        // ---------- main area ----------
+        private JComponent buildMain() {
+            JPanel center = new JPanel(new BorderLayout());
+            center.setBackground(Theme.BG);
+            center.setBorder(new EmptyBorder(14, 6, 10, 14));
+
+            JPanel nav = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+            nav.setOpaque(false);
+            String[][] tabs = {{"TRACE", "TRACE"}, {"COMPARE", "COMPARE"}, {"STEP LOG", "LOG"}, {"USER GUIDE", "GUIDE"}};
+            ButtonGroup bg = new ButtonGroup();
+            for (int i = 0; i < tabs.length; i++) {
+                NavButton b = new NavButton(tabs[i][0]);
+                String key = tabs[i][1];
+                b.addActionListener(e -> cards.show(content, key));
+                bg.add(b);
+                nav.add(b);
+                if (i == 0) b.setSelected(true);
+            }
+
+            cards = new CardLayout();
+            content = new JPanel(cards);
+            content.setOpaque(false);
+
+            traceHost = new JPanel();
+            traceHost.setLayout(new BoxLayout(traceHost, BoxLayout.Y_AXIS));
+            traceHost.setBackground(Theme.BG);
+            traceHost.setBorder(new EmptyBorder(12, 2, 12, 12));
+            content.add(darkScroll(traceHost), "TRACE");
+
+            compareHost = new JPanel(new BorderLayout());
+            compareHost.setBackground(Theme.BG);
+            content.add(darkScroll(compareHost), "COMPARE");
+
+            logArea = styledArea();
+            content.add(darkScroll(logArea), "LOG");
+
+            JTextArea guide = styledArea();
+            guide.setFont(Theme.ui(Font.PLAIN, 14));
+            guide.setText(GUIDE);
+            guide.setCaretPosition(0);
+            content.add(darkScroll(guide), "GUIDE");
+
+            center.add(nav, BorderLayout.NORTH);
+            center.add(content, BorderLayout.CENTER);
+            return center;
+        }
+
+        private JTextArea styledArea() {
+            JTextArea a = new JTextArea();
+            a.setEditable(false);
+            a.setBackground(Theme.BG);
+            a.setForeground(Theme.TEXT);
+            a.setCaretColor(Theme.ACCENT);
+            a.setFont(Theme.mono(Font.PLAIN, 13));
+            a.setBorder(new EmptyBorder(16, 16, 16, 16));
+            a.setLineWrap(false);
+            return a;
+        }
+
+        // ---------- behaviour ----------
+        private void setFrames(int n) {
+            frameCount = Math.max(1, Math.min(MAX_FRAMES, n));
+            frameLbl.setText(String.valueOf(frameCount));
+        }
+
+        private void loadSample(String refs, int frames) {
+            refField.setText(refs);
+            setFrames(frames);
+        }
+
+        private void setStatus(String msg, boolean error) {
+            status.setForeground(error ? Theme.FAULT : Theme.MUTED);
+            status.setText("<html><div style='width:280px'>" + msg.replace("<", "&lt;") + "</div></html>");
+        }
+
+        private int delay() { return 1000 - speed.getValue() * 90; }
+
+        private void stopTimer() {
+            if (timer != null) { timer.stop(); timer = null; }
+        }
+
+        private void clearAll() {
+            stopTimer();
+            refField.setText("");
+            traces.clear();
+            traceHost.removeAll();
+            compareHost.removeAll();
+            logArea.setText("");
+            last = new ArrayList<>();
+            traceHost.revalidate();
+            traceHost.repaint();
+            compareHost.revalidate();
+            compareHost.repaint();
+            setStatus("Cleared. Enter a new reference string.", false);
+        }
+
+        private void runSimulation(boolean animateNow) {
+            stopTimer();
+            int[] refs;
+            try {
+                refs = Engine.parseRefs(refField.getText());
+            } catch (IllegalArgumentException ex) {
+                setStatus(ex.getMessage(), true);
+                return;
+            }
+            List<Result> rs = new ArrayList<>();
+            for (Algo a : Algo.values())
+                if (pills[a.ordinal()].isSelected()) rs.add(Engine.simulate(a, refs, frameCount));
+            if (rs.isEmpty()) {
+                setStatus("Select at least one algorithm to run.", true);
+                return;
+            }
+            last = rs;
+
+            // trace cards
+            traces.clear();
+            traceHost.removeAll();
+            for (Result r : rs) {
+                AlgoCard card = new AlgoCard(r);
+                traces.add(card.trace);
+                traceHost.add(card);
+                traceHost.add(Box.createRigidArea(new Dimension(0, 14)));
+            }
+            traceHost.add(Box.createVerticalGlue());
+            traceHost.revalidate();
+            traceHost.repaint();
+
+            // compare
+            compareHost.removeAll();
+            compareHost.add(new ComparePanel(rs), BorderLayout.NORTH);
+            compareHost.revalidate();
+            compareHost.repaint();
+
+            // log
+            logArea.setText(fullText(rs));
+            logArea.setCaretPosition(0);
+
+            cards.show(content, "TRACE");
+            if (animateNow) startAnimation();
+            setStatus("Simulated " + refs.length + " references with " + frameCount + " frame(s).", false);
+        }
+
+        private String fullText(List<Result> rs) {
+            StringBuilder sb = new StringBuilder();
+            for (Result r : rs) sb.append(Engine.report(r)).append('\n');
+            sb.append(Engine.summary(rs)).append("\n\n");
+            for (Result r : rs) sb.append(Engine.stepLog(r)).append('\n');
+            return sb.toString();
+        }
+
+        private void startAnimation() {
+            for (TracePanel t : traces) t.setShown(0, true);
+            timer = new javax.swing.Timer(delay(), e -> {
+                boolean more = false;
+                for (TracePanel t : traces) {
+                    if (t.shown < t.r.refs.length) {
+                        t.setShown(t.shown + 1, true);
+                        more = true;
+                    }
+                }
+                if (!traces.isEmpty() && more) traces.get(0).followCurrent();
+                if (!more) {
+                    stopTimer();
+                    for (TracePanel t : traces) t.setShown(t.r.refs.length, false);
+                }
+            });
+            timer.start();
+        }
+
+        private void exportReport() {
+            if (last.isEmpty()) {
+                setStatus("Nothing to export yet. Run a simulation first.", true);
+                return;
+            }
+            JFileChooser fc = new JFileChooser();
+            fc.setSelectedFile(new File("page_replacement_report.txt"));
+            if (fc.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
+                try {
+                    Files.write(fc.getSelectedFile().toPath(), fullText(last).getBytes(StandardCharsets.UTF_8));
+                    setStatus("Report saved to " + fc.getSelectedFile().getName(), false);
+                } catch (IOException ex) {
+                    setStatus("Could not save file: " + ex.getMessage(), true);
+                }
+            }
+        }
+    }
+
+    static final String GUIDE =
+            "PAGE REPLACEMENT LAB - USER GUIDE\n"
+            + "==================================================\n\n"
+            + "1. HOW TO RUN\n"
+            + "   VS Code : open PageReplacementSimulator.java and click Run (above main).\n"
+            + "   Terminal: javac PageReplacementSimulator.java\n"
+            + "             java PageReplacementSimulator\n"
+            + "   Tests   : java PageReplacementSimulator --test   (expected vs actual)\n\n"
+            + "2. INPUTS\n"
+            + "   Page-reference string : whole numbers (0-999) separated by spaces or commas.\n"
+            + "                           Example: 7 0 1 2 0 3 0 4 2 3 0 3 2 1 2 0 1 7 0 1\n"
+            + "   Number of frames      : use the - / + buttons (1 to 12).\n"
+            + "   Algorithms            : toggle FIFO, LRU and OPTIMAL (keep all three for comparison).\n"
+            + "   Quick samples         : Textbook, Belady (anomaly demo) or Random.\n"
+            + "   Animate               : replays the trace one reference at a time.\n"
+            + "   Press RUN SIMULATION (or Enter in the text box).\n\n"
+            + "3. READING THE OUTPUT\n"
+            + "   TRACE tab   : one card per algorithm. Columns are references in order.\n"
+            + "                 Reference row = page requested.\n"
+            + "                 Frame rows    = contents of each frame after the request.\n"
+            + "                 Red cell      = page just loaded on a FAULT.\n"
+            + "                 Green cell    = page found in memory on a HIT.\n"
+            + "                 Result row    = HIT or FAULT.   Evicted row = page that was replaced.\n"
+            + "                 Chips show total hits, faults, hit ratio and fault ratio (%).\n"
+            + "   COMPARE tab : bar of hits (green) vs faults (red) and the algorithm with fewest faults.\n"
+            + "   STEP LOG    : text table identical to a console print-out, plus a sentence per step\n"
+            + "                 explaining why a page was kept or evicted.\n"
+            + "   Export      : saves the complete report as a .txt file.\n\n"
+            + "4. ALGORITHM RULES\n"
+            + "   FIFO    : when memory is full, remove the page that has been resident the longest.\n"
+            + "   LRU     : remove the page that was used least recently (a hit refreshes recency).\n"
+            + "   OPTIMAL : remove the page whose next use is farthest in the future\n"
+            + "             (pages never used again go first; ties -> oldest loaded page).\n\n"
+            + "5. FORMULAS\n"
+            + "   Hit ratio   = hits   / total references x 100\n"
+            + "   Fault ratio = faults / total references x 100\n"
+            + "   Hits + Faults = total references\n\n"
+            + "6. ERRORS\n"
+            + "   Empty input, non-numeric tokens, negative numbers or more than 60 references\n"
+            + "   show a red message under the buttons; nothing is simulated until fixed.\n";
+
+    // =====================================================================
+    //  5.  ENTRY POINT
+    // =====================================================================
+    public static void main(String[] args) {
+        if (args.length > 0 && (args[0].equals("--test") || args[0].equals("test"))) {
+            System.exit(Engine.selfTest() == 0 ? 0 : 1);
+        }
+        try {
+            UIManager.setLookAndFeel(UIManager.getCrossPlatformLookAndFeelClassName());
+        } catch (Exception ignored) { }
+        SwingUtilities.invokeLater(() -> new App().setVisible(true));
+    }
+}
